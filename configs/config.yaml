@@ -1,0 +1,176 @@
+defaults:
+  - _self_
+  - task: unified
+
+# ----------- Parameter Definitions -----------
+# Global seed
+seed: 42
+# Ignore warnings
+ignore_warnings: true
+# Debug mode
+debug: false
+
+# Paths
+work_dir: ${hydra:runtime.cwd}
+data_dir: ${work_dir}/data
+
+# Experiment Name
+name: "sf_fuse_ft_run"
+
+# ----------- Training Configuration -----------
+train:
+  seed: ${seed}
+  ckpt: checkpoints/last.ckpt  # Auto-resume from last checkpoint if exists
+  test: true  # Run test after training
+  validate_at_start: false  # Run validation before training
+  ema: 0.0  # EMA decay rate (0 = disabled)
+  
+  # Validation and monitoring intervals
+  interval: step  # 'step' or 'epoch' for scheduler
+  monitor: val/loss  # Metric to monitor for best checkpoint
+  mode: min  # 'max' or 'min'
+  
+  # Validation frequency
+  num_validations: 5            # Validate 5 times (every 1/5 total steps). Takes priority over val_every_n_steps.
+  val_every_n_steps: 2000       # Fallback: validate every N global steps (used only if num_validations is null)
+  save_last_every_n_steps: 500  # Save last.ckpt every N training steps
+  
+  # Batch size configuration
+  # effective_batch_size = micro_batch_size * num_gpus * accumulate_grad_batches
+  # If global_batch_size is set (not null), accumulate_grad_batches is auto-computed.
+  global_batch_size: null       # Effective batch size per parameter update (null = use trainer.accumulate_grad_batches as-is)
+
+# ----------- Pre-training Configuration -----------
+# MLM pre-training phase before main fine-tuning.
+# When enabled, the encoder layers (first n_pre_layers) are pre-trained
+# with MLM objective before the full model is fine-tuned.
+pretrain:
+  enabled: false          # Set to true to enable pre-training phase
+  steps: 10000            # Number of pre-training steps
+  lr: 1e-3                # Pre-training learning rate
+  warmup_steps: 1000      # Warmup steps for pre-training scheduler
+  min_lr: 1e-5            # Minimum learning rate (for cosine scheduler)
+  weight_decay: 0.01      # Weight decay for pre-training optimizer
+  scheduler: cosine_warmup # Scheduler type (cosine_warmup, linear_warmup, constant_warmup)
+  gradient_clip_val: 1.0  # Gradient clipping for pre-training
+  val_every_n_steps: 2000 # Validate every N steps during pre-training
+  max_epochs: 999         # Max epochs (effectively unlimited, controlled by steps)
+
+# ----------- WandB Configuration -----------
+# Set wandb.mode to 'disabled' to disable logging
+wandb:
+  project: sf-fuse-ft
+  group: ""
+  job_type: training
+  mode: disabled  # 'online', 'offline', or 'disabled' - disabled to avoid wandb issues
+  name: ${name}
+  save_dir: "."
+  id: null
+
+# ----------- Trainer Configuration -----------
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  strategy: ddp
+  min_epochs: 1
+  max_epochs: 100
+  enable_model_summary: true
+  log_every_n_steps: 10
+
+  # Validation settings - Use callback for step-based validation
+  val_check_interval: null  # Disabled - use val_every_n_global_steps callback
+  check_val_every_n_epoch: 99999  # Effectively disabled - use callback instead
+
+  # Precision and optimization
+  precision: "bf16"
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+
+  # Limits (null = no limit)
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 50000  # Limit training to 50k steps (~1.5 days)
+
+# ----------- Callbacks Configuration -----------
+callbacks:
+  # Learning Rate Monitor
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: ${train.interval}
+
+  # Parameters Logger
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+
+  # Training Timer
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+
+  # Validate Every N Global Steps (works with gradient accumulation)
+  val_every_n_global_steps:
+    _target_: src.callbacks.validation.ValEveryNGlobalSteps
+    every_n: ${train.val_every_n_steps}
+    num_validations: ${train.num_validations}
+
+  # Best Validation Checkpoint (saves model with best val metric)
+  # Overwrites best.ckpt each time a better model is found
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: ${train.monitor}
+    mode: ${train.mode}
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+
+  # Last Checkpoint (every N steps for resuming training)
+  # Overwrites last.ckpt each time
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: ${train.save_last_every_n_steps}
+    save_on_train_epoch_end: false
+
+  # Progress Bar
+  progress_bar:
+    _target_: pytorch_lightning.callbacks.TQDMProgressBar
+    refresh_rate: 50
+
+  # Rich Model Summary
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+
+  # Early Stopping (stop training when val metric stops improving)
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: ${train.monitor}
+    mode: ${train.mode}
+    patience: 10           # Number of validation checks with no improvement
+    min_delta: 0.0001      # Minimum change to qualify as an improvement
+    verbose: true
+
+# ----------- Hydra Configuration -----------
+hydra:
+  run:
+    dir: ./outputs/${name}  # Use experiment name as output directory
+  job:
+    chdir: true

@@ -1,0 +1,237 @@
+# @package _global_
+
+# ============================================================================
+# Model C: DualRep (MLM Pretraining + LoRA Fine-tuning)
+# Full Wisteria configuration (d_model=768)
+#
+# Architecture (Appendix A.3):
+#   Encoder: 12-layer Wisteria (5 GCMB + 6 BiMamba + 1 FoPE)
+#   CNN Bridge: 128x downsampling
+#   Decoder: 11-layer gated attention decoder (headwise gate)
+#   Head: Output projection (896 bins × 5,313 tracks)
+# ============================================================================
+
+name: "dualrep_wisteria_d768"
+
+wandb:
+  project: sf-fuse-ft
+  group: "dualrep-wisteria"
+  job_type: fine-tuning
+  mode: disabled
+  name: ${name}
+  save_dir: "."
+  id: null
+
+task:
+  _target_: src.tasks.unified_task.SFFuseTask
+  _recursive_: false
+
+  # Encoder layers before bridge (12 layers for Wisteria encoder)
+  n_pre_layers: 12
+
+  # CNN Bridge: 128x downsampling (131072 -> 1024)
+  bridge_config:
+    d_model: 768
+    num_downsample_stages: 7
+    kernel_size: 5
+    dropout: 0.1
+
+  # Encoder Configuration (Wisteria: 12-layer Caduceus)
+  # 5×GCMB (conv_layers_per_module=5, dilation_base=3)
+  # 6×BiMamba (ssm_cfg)
+  # 1×FoPE Attention (layer 11, 0-indexed)
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 768
+      n_layer: 12  # Pure Wisteria encoder (5 GCMB + 6 BiMamba + 1 FoPE)
+      vocab_size: 12
+      d_intermediate: 1536  # 2× d_model
+
+      # Module config for 12-layer encoder
+      n_modules: 1
+      layers_per_module: 12
+      conv_layers_per_module: 5  # First 5 layers use GCMB (dilated conv)
+      attn_layer_in_module: [11]  # Layer 11 (0-indexed) = 12th layer = FoPE attention
+      dilation_base: 3  # Base for dilated convolutions in GCMB
+      dropout: 0.0
+
+      # SSM Config for BiMamba layers (layers 5-10, 6 layers total)
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config for FoPE layer (layer 11)
+      attn_cfg:
+        num_heads: 12  # 768 / 12 = 64 dim per head
+        head_dim: null
+        mlp_dim: 768
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention for encoder's FoPE layer
+      headwise_attn_output_gate: true
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # Decoder Configuration (11-layer Gated Attention Decoder)
+  # Implements Thesis Formula 4-1: GatedAttn(Q,K,V) = σ(g) ⊙ Attn(Q,K,V)
+  decoder_config:
+    _target_: src.models.gated_attention_decoder.GatedAttentionDecoder
+    d_model: 768
+    n_layers: 11
+    num_heads: 12
+    head_dim: null  # 768 / 12 = 64 dim per head
+    mlp_dim: 1536  # 2× d_model
+    dropout: 0.0
+    headwise_gate: true  # Query-dependent scalar gate per head (Formula 4-1)
+    elementwise_gate: false
+    causal_mask: false  # Bidirectional context for functional prediction
+    use_fourier_pos_emb: true
+    fourier_max_seq_len: 1024  # Decoder operates at 1024 resolution
+    fourier_dim: null
+
+  # Head Configuration
+  head_config:
+    d_model: 768
+    num_tracks: 5313
+    hidden_dim: 1536  # 2× d_model
+    target_len: 896
+    dropout: 0.4
+
+  # No joint MLM loss - use standalone MLM pretraining first
+  use_mlm_loss: false
+
+  # LoRA Configuration for fine-tuning (Appendix A.3)
+  use_lora: true
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules:
+    - query
+    - value
+
+  # Optimizer & Scheduler (Appendix A.3)
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 1000
+    min_lr: 1e-6
+
+  # Training Strategy
+  freeze_encoder: false
+  pretrained_ckpt_path: null  # Set path to MLM-pretrained encoder checkpoint
+
+  # Data Configuration (H5 format for fine-tuning)
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    val_data_file: "./data/raw/human_valid.h5"
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1
+    num_workers: 4
+    max_length: 131072
+
+# Trainer config for fine-tuning (Appendix A.3: 10 epochs, batch size 32)
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 8  # 8 GPUs for distributed training
+  strategy: auto
+  num_nodes: 1
+  min_epochs: 1
+  max_epochs: 10
+  enable_model_summary: true
+  log_every_n_steps: 50
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1  # Auto-computed by run_finetune.sh for global_batch_size=32
+  check_val_every_n_epoch: 99999
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 500000  # Effectively unlimited, controlled by max_epochs
+
+callbacks:
+  # Override to disable validation callback - must be set to false (not None) to be skipped
+  val_every_n_global_steps:
+    enabled: true
+    every_n: 10000  # Validate every 10k steps (~5 times for 50k total steps)
+  # Only keep essential callbacks
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 500
+    save_on_train_epoch_end: false

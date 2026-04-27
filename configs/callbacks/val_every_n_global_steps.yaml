@@ -1,0 +1,6 @@
+# Validation callback configuration
+
+val_every_n_global_steps:
+  _target_: src.callbacks.validation.ValEveryNGlobalSteps
+  every_n: ${train.val_every_n_steps}
+  num_validations: ${train.num_validations}

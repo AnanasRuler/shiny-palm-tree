@@ -1,0 +1,170 @@
+# @package _global_
+
+# ============================================================================
+# Model A: From Scratch (no pretraining) - Simple Configuration
+# Mini configuration (d_model=128) with simplified validation
+# ============================================================================
+
+task:
+  _target_: src.tasks.unified_task.SFFuseTask
+  _recursive_: false
+
+  # Encoder layers before bridge (2 layers)
+  n_pre_layers: 2
+
+  # CNN Bridge: 128x downsampling (131072 -> 1024)
+  bridge_config:
+    d_model: 128
+    num_downsample_stages: 7
+    kernel_size: 5
+    dropout: 0.1
+
+  # Encoder Configuration (Caduceus with d_model=128)
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 128
+      n_layer: 8
+      vocab_size: 12
+      d_intermediate: 256
+
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config
+      attn_cfg:
+        num_heads: 8
+        head_dim: null
+        mlp_dim: 128
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention
+      headwise_attn_output_gate: false
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # Head Configuration
+  head_config:
+    d_model: 128
+    num_tracks: 5313
+    hidden_dim: 256
+    target_len: 896
+    dropout: 0.4
+
+  # No MLM loss for this model
+  use_mlm_loss: false
+
+  # Optimizer & Scheduler
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 500
+    min_lr: 1e-6
+
+  # Training Strategy
+  freeze_encoder: false
+  pretrained_ckpt_path: null
+
+  # Data Configuration (H5 format for fine-tuning)
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    train_targets_file: null
+    val_data_file: "./data/raw/human_valid.h5"
+    val_targets_file: null
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1
+    num_workers: 2
+    max_length: 131072
+
+# Simplified trainer config with epoch-based validation
+trainer:
+  devices: 1
+  strategy: null
+  min_epochs: 1
+  max_epochs: 2
+  enable_model_summary: true
+  log_every_n_steps: 50
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  # Use epoch-based validation instead of step-based to avoid hanging
+  check_val_every_n_epoch: 1
+  limit_train_batches: 50
+  limit_val_batches: 20
+
+# No custom validation callback to avoid potential hanging issues
+callbacks:
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: val/loss
+    mode: min
+    patience: 10
+    min_delta: 0.0001
+    verbose: true

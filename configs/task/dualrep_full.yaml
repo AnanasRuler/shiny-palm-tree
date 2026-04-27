@@ -1,0 +1,223 @@
+# @package _global_
+
+# ============================================================================
+# Model C: DualRep (MLM Pretraining + LoRA Fine-tuning)
+# Full configuration (d_model=768) - Matches thesis Chapter 4
+# ============================================================================
+# Thesis reference:
+#   - Encoder: d_model=768, n_layer=8 (5 GCMB + 2 BiMamba + 1 FoPE attention)
+#   - CNN Bridge: 7 stages, kernel_size=15, stride=2, 128x downsampling
+#   - Decoder: 11 layers gated attention
+#   - Output: (B, 896, 5313)
+# ============================================================================
+
+name: "dualrep_full_d768"
+
+wandb:
+  project: sf-fuse-ft
+  group: "dualrep-lora"
+  job_type: fine-tuning
+  mode: disabled
+  name: ${name}
+  save_dir: "."
+  id: null
+
+task:
+  _target_: src.tasks.unified_task.SFFuseTask
+  _recursive_: false
+
+  # Encoder layers before bridge (2 layers for sandwich architecture)
+  # Thesis: 8-layer encoder, 11-layer decoder
+  # Here: n_pre_layers=2 means 2 layers before bridge, 6 after (total 8)
+  n_pre_layers: 2
+
+  # CNN Bridge: 128x downsampling (131072 -> 1024)
+  # Thesis: kernel_size=15, 7 stages of stride-2 convolution
+  bridge_config:
+    d_model: 768
+    num_downsample_stages: 7
+    kernel_size: 15  # Thesis value
+    dropout: 0.1
+
+  # Encoder Configuration (Caduceus with d_model=768)
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 768
+      n_layer: 8
+      vocab_size: 12
+      d_intermediate: 1536  # 2x d_model
+
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config (GCMB + BiMamba)
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config (FoPE attention)
+      attn_cfg:
+        num_heads: 48  # 768/16=48, head_dim=16
+        head_dim: 16
+        mlp_dim: 768
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Fourier Position Embedding (covers full 131k input)
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention (Thesis: headwise gate)
+      # Formula: GatedAttn(Q,K,V) = sigmoid(g) * Attn(Q,K,V), g = QW_g
+      headwise_attn_output_gate: true
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # Head Configuration
+  head_config:
+    d_model: 768
+    num_tracks: 5313
+    hidden_dim: 1536  # 2x d_model
+    target_len: 896  # Center crop (1024 - 2*64)
+    dropout: 0.4
+
+  # No joint MLM loss - use standalone MLM pretraining first (two-stage)
+  use_mlm_loss: false
+
+  # LoRA Configuration for parameter-efficient fine-tuning
+  # Thesis: r=8, alpha=16, encoder-side 2.8M parameters
+  use_lora: true
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules:
+    - query
+    - value
+
+  # Optimizer & Scheduler
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 1000
+    min_lr: 1e-6
+
+  # Training Strategy
+  freeze_encoder: false
+  # Path to MLM pretraining checkpoint (update after stage-1)
+  pretrained_ckpt_path: null
+
+  # Data Configuration (H5 format for fine-tuning)
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    val_data_file: "./data/raw/human_valid.h5"
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1
+    num_workers: 4
+    max_length: 131072
+
+# Trainer config for fine-tuning
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 8  # 8 GPUs recommended for d_model=768
+  strategy: auto
+  num_nodes: 1
+  min_epochs: 1
+  max_epochs: 50
+  enable_model_summary: true
+  log_every_n_steps: 50
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 99999
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 100000
+
+callbacks:
+  # Only validate a few times during training
+  val_every_n_global_steps:
+    enabled: true
+    every_n_steps: 20000  # Validate every 20k steps for 5 validations total
+  # Keep essential callbacks
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 1000
+    save_on_train_epoch_end: false

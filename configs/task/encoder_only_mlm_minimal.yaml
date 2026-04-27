@@ -1,0 +1,190 @@
+# @package _global_
+
+# ============================================================================
+# Model B: Encoder-Only + MLM Pretraining
+# Mini configuration (d_model=128) - All 8 layers as encoder
+# ============================================================================
+
+name: "encoder_only_mlm_minimal_d128"
+
+wandb:
+  project: sf-fuse-ft
+  group: "mlm-pretrain"
+  job_type: pretraining
+  mode: disabled
+  name: ${name}
+  save_dir: "."
+  id: null
+
+task:
+  _target_: src.tasks.mlm_pretrain.MLMPretrainTask
+  _recursive_: false
+
+  # Encoder Configuration (Caduceus with d_model=128)
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 128
+      n_layer: 8
+      vocab_size: 12
+      d_intermediate: 256
+
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config
+      attn_cfg:
+        num_heads: 8
+        head_dim: null
+        mlp_dim: 128
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention
+      headwise_attn_output_gate: false
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # Pre-training Options
+  n_pretrain_layers: null  # Train all 8 layers
+
+  # [MASK] token ID
+  mask_token_id: 5
+
+  # Save path for HF model
+  save_hf_path: null
+
+  # Optimizer & Scheduler
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 1e-3
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 500
+    min_lr: 1e-6
+
+  # Dataset Configuration
+  dataset:
+    train_data_file: "./data/hg38/hg38.ml.fa"
+    val_data_file: null
+    seq_length: 131072
+    batch_size: 1
+    num_workers: 4
+    mask_prob: 0.15
+    mask_token_prob: 0.8
+    random_token_prob: 0.1
+    train_samples_per_epoch: 10000
+    val_samples_per_epoch: 1000
+    min_chr_length: 1000000
+    exclude_chr: "chrM,chrUn,chrEBV,_random,_alt,_fix"
+    max_n_ratio: 0.1
+    h5_seq_key: "sequences"
+
+# Trainer config for MLM pretraining
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  strategy:
+    _target_: pytorch_lightning.strategies.DDPStrategy
+    find_unused_parameters: true
+  min_epochs: 1
+  max_epochs: 10
+  enable_model_summary: true
+  log_every_n_steps: 50
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 99999
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 15000
+
+callbacks:
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 1000
+    save_on_train_epoch_end: false

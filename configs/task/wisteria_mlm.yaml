@@ -1,0 +1,253 @@
+# @package _global_
+
+# ============================================================================
+# Wisteria Encoder MLM Pre-training Configuration
+# ============================================================================
+# Pre-train the 12-layer Wisteria encoder with Masked Language Modeling (MLM).
+#
+# This is Phase 1 of DualRep training:
+#   1. Pre-train encoder with MLM on reference genome (hg38)
+#   2. Save encoder weights
+#   3. Fine-tune with frozen encoder + LoRA + gated attention decoder (Phase 2)
+#
+# Architecture (Appendix A.3):
+#   Input tokens (B, 131072) with 15% MLM masking
+#   → Caduceus Embedding
+#   → 12-layer Wisteria Encoder (5 GCMB + 6 BiMamba + 1 FoPE attention)
+#   → LayerNorm
+#   → MLM Head (Linear → vocab_size)
+#   → CrossEntropy Loss on masked positions
+#
+# Usage:
+#   python pretrain_mlm.py task=wisteria_mlm
+#   python pretrain_mlm.py task=wisteria_mlm task.dataset.train_data_file=/path/to/hg38.fa
+# ============================================================================
+
+defaults:
+  - _self_
+  - mlm_pretrain  # Inherit base MLM pretraining config
+
+name: "wisteria_mlm_pretrain_d768"
+
+task:
+  _target_: src.tasks.mlm_pretrain.MLMPretrainTask
+  _recursive_: false
+
+  # Number of encoder layers to pre-train (null = all layers)
+  # For DualRep: pre-train all 12 Wisteria encoder layers
+  n_pretrain_layers: null
+
+  # [MASK] token ID
+  mask_token_id: 5
+
+  # Save path for HuggingFace format model (null = auto: outputs/{name}/hf_model)
+  save_hf_path: null
+
+  # --- Encoder Configuration (12-layer Wisteria) ---
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 768  # Appendix A.3: DualRep uses d_model=768
+      n_layer: 12   # 12-layer Wisteria encoder
+      vocab_size: 12
+      d_intermediate: 1536  # 2× d_model
+
+      # Module config for 12-layer encoder
+      n_modules: 1
+      layers_per_module: 12
+      conv_layers_per_module: 5  # First 5 layers: GCMB (dilated conv)
+      attn_layer_in_module: [11]  # Layer 11 (0-indexed) = 12th layer = FoPE attention
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config for BiMamba layers (layers 5-10, 6 layers total)
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config for FoPE layer (layer 11)
+      attn_cfg:
+        num_heads: 12  # 768 / 12 = 64 dim per head
+        head_dim: null
+        mlp_dim: 768
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings (must cover 131k input)
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention (headwise gate for DualRep compatibility)
+      headwise_attn_output_gate: true
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # --- Optimizer & Scheduler (Appendix A.3) ---
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4  # Same as fine-tuning for consistency
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 1000
+    min_lr: 1e-6
+
+  # --- Dataset Configuration ---
+  dataset:
+    # Path to reference genome (FASTA .fa or pre-tokenized .h5)
+    # Default: update to your hg38 path
+    train_data_file: "/path/to/hg38.fa"
+    val_data_file: null
+
+    # Sequence parameters
+    seq_length: 131072
+    batch_size: 1
+    num_workers: 4
+
+    # MLM masking parameters
+    mask_prob: 0.15
+    mask_token_prob: 0.8
+    random_token_prob: 0.1
+
+    # Sampling parameters
+    train_samples_per_epoch: 10000
+    val_samples_per_epoch: 1000
+
+    # Genome filtering (FASTA mode)
+    min_chr_length: 1000000
+    exclude_chr: "chrM,chrUn,chrEBV,_random,_alt,_fix"
+    max_n_ratio: 0.1
+
+    # H5 mode
+    h5_seq_key: "sequences"
+
+# Trainer config for MLM pre-training (8 GPUs for Wisteria d=768)
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 8  # 8 GPUs for distributed training
+  strategy: auto
+  num_nodes: 1
+  min_epochs: 1
+  max_epochs: 10  # Appendix A.3: 10 epochs for pre-training
+  enable_model_summary: true
+  log_every_n_steps: 50
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 99999
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: -1  # Controlled by max_epochs
+
+callbacks:
+  # Validate every 10k steps (~5 times for 50k total steps)
+  val_every_n_global_steps:
+    _target_: src.callbacks.validation.ValEveryNGlobalSteps
+    every_n: 10000
+    num_validations: 5
+
+  # Best checkpoint (monitors MLM validation loss)
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: "pretrain_val/loss"
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+
+  # Last checkpoint (periodic save for resuming)
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 500
+    save_on_train_epoch_end: false
+
+  # Learning rate monitor
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  # Parameters logger
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+
+  # Timer
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+
+  # Progress bar
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+
+  # Model summary
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+
+  # Early stopping
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "pretrain_val/loss"
+    mode: "min"
+    patience: 5
+    min_delta: 0.001
+    verbose: true
+
+# WandB configuration
+wandb:
+  project: sf-fuse-ft
+  group: "wisteria-mlm-pretrain"
+  job_type: pretraining
+  mode: disabled
+  name: ${name}
+  save_dir: "."
+  id: null

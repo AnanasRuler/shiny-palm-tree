@@ -1,0 +1,125 @@
+# @package _global_
+task:
+  _target_: src.tasks.sf_fuse_ft.SFFuseFineTuningTask
+  _recursive_: false
+
+  # --- Encoder Configuration (DNA-LM Backbone) ---
+  # NOTE: When using pretrained_ckpt_path, most encoder_config parameters are 
+  # automatically loaded from the pretrained model's config.json.
+  # The d_model and vocab_size below are only used when training from scratch.
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 256           # Overridden by pretrained model if pretrained_ckpt_path is set
+      n_layer: 8             # Overridden by pretrained model
+      vocab_size: 12         # Overridden by pretrained model (typically 16 for pretrained)
+      d_intermediate: 512
+      
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+      
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+      
+      # Attention Config
+      attn_cfg: 
+        num_heads: 16
+        head_dim: null
+        mlp_dim: 256
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+      
+      # Positional Embeddings
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072 # Aligned with SF-Fuse
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+      
+      # Gated Attention (from gated_attention paper)
+      # headwise: per-head scalar gate after SDPA output
+      # elementwise: per-element gate after SDPA output
+      # Only one can be true at a time; both false = standard attention
+      headwise_attn_output_gate: false
+      elementwise_attn_output_gate: false
+      
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # --- Head Configuration (SF-Fuse Decoder) ---
+  # NOTE: d_model and head_hidden_dim are automatically updated to match
+  # the pretrained encoder when using pretrained_ckpt_path.
+  head_config:
+    d_model: 256         # Auto-updated from pretrained model
+    num_tracks: 5313     # Human tracks (change to 1643 for mouse)
+    head_hidden_dim: 512 # Auto-updated to 2 * d_model from pretrained
+    pooling_factor: 128  
+    target_len: 896      
+
+  # --- Optimizer & Scheduler ---
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup     # Options: cosine_warmup, linear_warmup, constant_warmup, cosine, constant
+    warmup_steps: 1000      # Number of warmup steps (linear increase)
+    min_lr: 1e-6            # Minimum LR after decay
+
+  # --- Training Strategy ---
+  freeze_encoder: False     # Set to True to freeze encoder and only train head
+  
+  # --- Pretrained Model Path ---
+  # Set this to load a pretrained DNA-LM for fine-tuning.
+  # Supported formats:
+  # 1. Local HuggingFace format directory: "path/to/model_dir" (containing config.json and model.safetensors)
+  # 2. HuggingFace Hub model ID: "username/model_name"
+  # Set to null to train from scratch.
+  pretrained_ckpt_path: null
+
+  # --- Joint Training (SF-Fuse + MLM) ---
+  use_mlm_loss: true       # Enable MLM auxiliary loss for joint training
+  mlm_lambda: 0.1          # Weight for MLM loss: total = task_loss + mlm_lambda * mlm_loss
+  mlm_probability: 0.15    # Probability of masking each token for MLM
+
+  # --- Data Configuration ---
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    train_targets_file: null 
+    val_data_file: "./data/raw/human_valid.h5"
+    val_targets_file: null
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1        
+    num_workers: 4       
+    max_length: 131072

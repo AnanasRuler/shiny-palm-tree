@@ -1,0 +1,178 @@
+defaults:
+  - _self_
+  - task: mlm_pretrain
+
+# ----------- Parameter Definitions -----------
+seed: 42
+ignore_warnings: true
+debug: false
+
+# Paths
+work_dir: ${hydra:runtime.cwd}
+data_dir: ${work_dir}/data
+
+# Experiment Name
+name: "mlm_pretrain"
+
+# ----------- Training Configuration -----------
+train:
+  seed: ${seed}
+  ckpt: null  # Resume from checkpoint (null = start fresh)
+  test: false
+  validate_at_start: false
+
+  # Validation and monitoring intervals
+  interval: step
+  # NOTE: If val_data_file is null, callbacks monitoring this metric are auto-disabled.
+  # When val data IS provided, pretrain_val/loss is monitored for best checkpoint + early stopping.
+  monitor: pretrain_val/loss
+  mode: min
+
+  # Validation frequency
+  num_validations: 5
+  val_every_n_steps: 5000
+  save_last_every_n_steps: 1000
+
+  # Batch size configuration (Thesis Appendix A.1: 4 GPUs × batch_size=2 = 8)
+  # Token-based batching: 1,048,576 tokens per update
+  # For seq_length=131,072: global_batch_size = 1,048,576 / 131,072 = 8
+  tokens_per_batch: 1048576
+  global_batch_size: null  # Auto-computed from tokens_per_batch
+
+# ----------- WandB Configuration -----------
+wandb:
+  project: sf-fuse-ft
+  group: "mlm-pretrain"
+  job_type: pretraining
+  mode: online
+  name: ${name}
+  save_dir: "."
+  id: null
+
+# ----------- Trainer Configuration -----------
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 4               # 4 GPUs (Thesis Appendix A.1)
+  strategy:
+    _target_: pytorch_lightning.strategies.DDPStrategy
+    find_unused_parameters: true
+  min_epochs: 1
+  max_epochs: 10
+  enable_model_summary: true
+  log_every_n_steps: 10
+
+  # Validation settings
+  val_check_interval: null
+  check_val_every_n_epoch: 99999
+
+  # Precision and optimization (Thesis: AMP mixed precision)
+  precision: "bf16"
+  gradient_clip_val: 1.0   # 1.0 (Thesis Appendix A.1)
+
+  # Gradient accumulation: set via command line or default to 1
+  # Formula: accumulate_grad_batches = ceil(global_batch_size / (devices × batch_size))
+  # Shell script computes and passes: trainer.accumulate_grad_batches=N
+  accumulate_grad_batches: 1
+
+  # Limits (Thesis: 50,000 steps)
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 50000         # 50,000 steps (Thesis Appendix A.1)
+
+# ----------- Callbacks Configuration -----------
+callbacks:
+  # Learning Rate Monitor
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: ${train.interval}
+
+  # Parameters Logger
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+
+  # Training Timer
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+
+  # Validate Every N Global Steps
+  val_every_n_global_steps:
+    _target_: src.callbacks.validation.ValEveryNGlobalSteps
+    every_n: ${train.val_every_n_steps}
+    num_validations: ${train.num_validations}
+
+  # Best Checkpoint (monitors MLM validation loss)
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: ${train.monitor}
+    mode: ${train.mode}
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+
+  # Last Checkpoint (periodic save for resuming) - aligned with caduceus project
+  # This callback saves a checkpoint every N training steps
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: true  # Always save the last checkpoint
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: ${train.save_last_every_n_steps}
+    save_on_train_epoch_end: false
+
+  # Checkpoint Every N Steps (aligned with caduceus project pretraining)
+  # Saves checkpoints every N steps during pretraining for recovery
+  model_checkpoint_every_n_steps:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "step-{step}"
+    monitor: null
+    mode: "min"
+    save_top_k: 0  # Do not save "best" models, only save every N steps
+    save_last: true  # Always save the last checkpoint from this callback
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 500  # Same as caduceus pretraining: 500 steps
+    save_on_train_epoch_end: false
+
+  # Rich Progress Bar
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+
+  # Rich Model Summary
+  rich_model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 3
+
+  # Early Stopping
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: ${train.monitor}
+    mode: ${train.mode}
+    patience: 5
+    min_delta: 0.001
+    verbose: true
+
+# ----------- Hydra Configuration -----------
+hydra:
+  run:
+    dir: ./outputs/${name}
+  job:
+    chdir: true

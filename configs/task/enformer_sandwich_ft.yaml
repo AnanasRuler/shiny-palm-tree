@@ -1,0 +1,156 @@
+# @package _global_
+
+# ============================================================================
+# SF-Fuse Fine-Tuning with Sandwich (Mid-Downsample) Architecture
+# ============================================================================
+# Architecture:
+#   Input tokens (B, 131072)
+#   → Caduceus Embedding
+#   → First n_pre_layers at full 131k length (long-range SSM processing)
+#   → CNN Bridge [128x downsampling via 7 stages of 2x]
+#   → Remaining (n_layer - n_pre_layers) at compressed 1024 length
+#   → Simple Head [crop to 896 + MLP]
+#   → (B, 896, 5313)
+#
+# Key advantages:
+#   - Pre-downsample layers capture long-range genomic context at full resolution
+#   - Post-downsample layers process efficiently at 1024 length
+#   - Single Caduceus model (supports direct pretrained weight loading)
+#   - Configurable split point via n_pre_layers
+#
+# Example with default config (8 total layers, n_pre_layers=2):
+#   Layer 0-1: Mamba SSM at 131k length (long-range context)
+#   CNN Bridge: 131072 → 1024 (128x downsample)
+#   Layer 2-7: Mamba/Attn at 1024 length (efficient processing)
+# ============================================================================
+
+task:
+  _target_: src.tasks.sf_fuse_sandwich_ft.SFFuseSandwichTask
+  _recursive_: false
+
+  # --- Sandwich Split Point ---
+  # Number of encoder layers that process the full-length (131k) sequence
+  # BEFORE the CNN bridge downsamples to 1024.
+  # Remaining layers (n_layer - n_pre_layers) process the shorter sequence.
+  #
+  # Recommendations:
+  #   n_pre_layers=1: Minimal full-length processing (fastest, least memory)
+  #   n_pre_layers=2: Good balance (default, recommended)
+  #   n_pre_layers=4: Half-and-half (more full-length context)
+  n_pre_layers: 2
+
+  # --- CNN Bridge Configuration ---
+  # Downsamples hidden states from 131072 → 1024 (128x) between encoder stages
+  bridge_config:
+    d_model: 256              # Auto-updated from encoder
+    num_downsample_stages: 7  # 2^7 = 128x total downsampling
+    kernel_size: 5            # Conv kernel size in residual blocks
+    dropout: 0.1              # Dropout in conv blocks
+
+  # --- Encoder Configuration (DNA-LM Backbone) ---
+  # Full Caduceus model. Layers are split by n_pre_layers:
+  #   - Layers [0, n_pre_layers) process at full sequence length
+  #   - Layers [n_pre_layers, n_layer) process at compressed length
+  # NOTE: fourier_max_seq_len should cover the full input length since
+  # pre-downsample attention layers (if any) need full-length support.
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 256
+      n_layer: 8
+      vocab_size: 12
+      d_intermediate: 512
+
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config
+      attn_cfg:
+        num_heads: 16
+        head_dim: null
+        mlp_dim: 256
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings
+      # Must cover full input length for pre-downsample attention layers
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention (from gated_attention paper)
+      headwise_attn_output_gate: false
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # --- Head Configuration (Simple Projection) ---
+  # Crops the compressed sequence to 896 bins, then MLP to predict tracks
+  head_config:
+    d_model: 256              # Auto-updated from encoder
+    num_tracks: 5313          # Human tracks (1643 for mouse)
+    hidden_dim: 512           # MLP hidden dim (auto: 2 * d_model)
+    target_len: 896           # SF-Fuse target bins
+    dropout: 0.4
+
+  # --- Optimizer & Scheduler ---
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 1000
+    min_lr: 1e-6
+
+  # --- Training Strategy ---
+  freeze_encoder: False
+  pretrained_ckpt_path: null
+
+  # --- Data Configuration ---
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    train_targets_file: null
+    val_data_file: "./data/raw/human_valid.h5"
+    val_targets_file: null
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1
+    num_workers: 4
+    max_length: 131072

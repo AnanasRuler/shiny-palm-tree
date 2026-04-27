@@ -1,0 +1,9 @@
+# Rich console callbacks for better visualization
+
+rich_model_summary:
+  _target_: pytorch_lightning.callbacks.RichModelSummary
+  max_depth: 3
+
+rich_progress_bar:
+  _target_: pytorch_lightning.callbacks.RichProgressBar
+  refresh_rate: 1

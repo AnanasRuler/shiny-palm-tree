@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Data files
+data/
+*.h5
+*.hdf5
+*.tfrecord
+*.fa
+*.fasta
+*.fa.gz
+*.bam
+*.bai
+*.bed
+*.bed.gz
+*.bigWig
+*.bigwig
+*.parquet
+
+# Checkpoints and model weights
+outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+hf_model/
+
+# Training logs
+wandb/
+lightning_logs/
+mlruns/
+runs/
+tb_logs/
+*.log
+
+# Hydra outputs
+multirun/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# System
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
+*.bak
+*.orig
+
+# Large archives
+*.tar.gz
+*.zip
+*.tar
+*.7z

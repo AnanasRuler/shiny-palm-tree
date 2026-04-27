@@ -1,0 +1,154 @@
+# @package _global_
+
+# ============================================================================
+# MLM Pre-training Task Configuration
+# ============================================================================
+# Pre-train the Caduceus DNA language model encoder with Masked Language
+# Modeling (MLM) on reference genome data (e.g., hg38).
+#
+# This trains a CaduceusForMaskedLM model. After pre-training, the model
+# is saved in HuggingFace format and can be loaded for downstream
+# fine-tuning (sandwich, CNN stem, or original architecture).
+#
+# Architecture:
+#   Input tokens (B, 131072) with MLM masking
+#   → Caduceus Embedding
+#   → Caduceus Encoder (Mamba SSM + Attention layers)
+#   → LM Head (Linear → vocab_size)
+#   → CrossEntropy Loss on masked positions
+#
+# Usage:
+#   python pretrain_mlm.py                              # Default
+#   python pretrain_mlm.py task.dataset.data_file=/path/to/hg38.fa
+#   python pretrain_mlm.py task.optimizer_config.args.lr=5e-4
+# ============================================================================
+
+task:
+  _target_: src.tasks.mlm_pretrain.MLMPretrainTask
+  _recursive_: false
+
+  # --- Encoder Configuration (Caduceus) ---
+  # Thesis Appendix A.1: Wisteria full model (d_model=768)
+  # Same architecture as used in fine-tuning. All layers are pre-trained.
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 768
+      n_layer: 12
+      vocab_size: 12
+      d_intermediate: 1536
+
+      # Module config (Thesis: 5 GCMB + 6 BiMamba + 1 FoPE Attention)
+      n_modules: 1
+      layers_per_module: 12
+      conv_layers_per_module: 5
+      attn_layer_in_module: 11
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config
+      attn_cfg:
+        num_heads: 16
+        head_dim: null
+        mlp_dim: 256
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings (must cover full 131k input length)
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention (Thesis: headwise gate for DualRep)
+      headwise_attn_output_gate: true
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # --- Pre-training Options ---
+  # n_pretrain_layers: Train only the first N encoder layers (null = all layers).
+  # This is useful if you want to pre-train only the layers that will serve as
+  # pre-downsample layers in the sandwich architecture.
+  n_pretrain_layers: null
+
+  # [MASK] token ID (CaduceusTokenizer: [MASK]=3)
+  mask_token_id: 3
+
+  # [PAD] token ID (CaduceusTokenizer: [PAD]=4) - used for ignore_index in loss
+  pad_token_id: 4
+
+  # Path to save HuggingFace format model after training (null = auto)
+  save_hf_path: null
+
+  # --- Optimizer & Scheduler (Thesis Appendix A.1) ---
+  # AdamW with thesis parameters
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 0.008           # 8e-3 (Thesis Appendix A.1)
+      weight_decay: 0.1   # 0.1 (Thesis Appendix A.1)
+      betas: [0.9, 0.95]  # [0.9, 0.95] (Thesis Appendix A.1)
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 2000     # 2,000 (Thesis Appendix A.1)
+    min_lr: 0.00008        # 8e-5 (Thesis Appendix A.1: 1% of peak lr)
+
+  # --- Dataset Configuration (Caduceus-style BED file approach) ---
+  dataset:
+    # Training data: BED file defining genomic intervals + FASTA file
+    # Official Caduceus BED file: downloaded from
+    # https://storage.googleapis.com/basenji_barnyard2/sequences_human.bed
+    train_bed_file: "${hydra:runtime.cwd}/data/hg38/human-sequences.bed"
+    train_fasta_file: "${hydra:runtime.cwd}/data/hg38/hg38.ml.fa"
+    train_split: "train"  # Split name in BED file
+
+    # Validation data: Use validation split from BED file
+    val_bed_file: "${hydra:runtime.cwd}/data/hg38/human-sequences.bed"
+    val_fasta_file: "${hydra:runtime.cwd}/data/hg38/hg38.ml.fa"
+    val_split: "valid"  # Split name in BED file (use "valid" for official Caduceus BED)
+
+    # Sequence parameters (Thesis: 131,072 bp = 2^17)
+    seq_length: 131072
+    batch_size: 2          # Per GPU batch size (4 GPUs × 2 = 8 global batch)
+    num_workers: 4
+
+    # MLM masking parameters (Thesis: 15% masking)
+    mlm: true
+    mlm_probability: 0.15
+
+    # Training samples per epoch (Thesis Appendix A.1)
+    train_samples_per_epoch: 10000
+    val_samples_per_epoch: 1000
+
+    # Augmentation
+    rc_augment: false  # RC augmentation handled at model level if needed

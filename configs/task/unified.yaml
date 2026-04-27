@@ -1,0 +1,158 @@
+# @package _global_
+
+# ============================================================================
+# SF-Fuse Fine-Tuning Task Configuration
+# ============================================================================
+# Architecture:
+#   Input tokens (B, 131072)
+#   → Caduceus Embedding
+#   → First n_pre_layers (encoder) at full 131k length
+#   → CNN Bridge [128x downsampling: 131072 → 1024]
+#   → Remaining layers (decoder) at compressed 1024 length
+#   → Simple Projection Head [center crop to 896 + MLP]
+#   → (B, 896, 5313)
+#
+# Special cases:
+#   n_pre_layers=0:  All layers after bridge (CNN Stem equivalent)
+#   n_pre_layers=2:  2 encoder + 6 decoder (Sandwich, default)
+#   n_pre_layers=8:  All layers before bridge (full-length processing)
+#
+# Joint training (use_mlm_loss=true):
+#   Encoder is also trained with MLM auxiliary loss.
+#   Total loss = task_loss + mlm_lambda * mlm_loss
+#
+# Pre-training (configured in top-level 'pretrain' section):
+#   Optional MLM pre-training phase for encoder before main training.
+#   Uses the same dataset with MLM masking.
+# ============================================================================
+
+task:
+  _target_: src.tasks.unified_task.SFFuseTask
+  _recursive_: false
+
+  # --- Encoder/Decoder Split Point ---
+  # Number of encoder layers that process full-length (131k) sequence
+  # BEFORE the CNN bridge downsamples to 1024.
+  # Remaining layers (n_layer - n_pre_layers) are decoder layers.
+  n_pre_layers: 2
+
+  # --- CNN Bridge Configuration ---
+  # Downsamples hidden states from 131072 → 1024
+  bridge_config:
+    d_model: 256              # Auto-updated from encoder
+    num_downsample_stages: 7  # 2^7 = 128x total downsampling
+    kernel_size: 5
+    dropout: 0.1
+
+  # --- Encoder Configuration (Caduceus DNA-LM Backbone) ---
+  encoder_config:
+    _name_: caduceus
+    config:
+      _target_: src.caduceus.configuration_caduceus.CaduceusConfig
+      d_model: 256
+      n_layer: 8
+      vocab_size: 12
+      d_intermediate: 512
+
+      # Module config
+      n_modules: 1
+      layers_per_module: 8
+      conv_layers_per_module: 5
+      attn_layer_in_module: 4
+      dilation_base: 3
+      dropout: 0.0
+
+      # SSM Config
+      ssm_cfg:
+        d_state: 16
+        d_conv: 4
+        expand: 2
+        dt_rank: "auto"
+        dt_min: 0.001
+        dt_max: 0.1
+        dt_init: "random"
+        dt_scale: 1.0
+        dt_init_floor: 1e-4
+        conv_bias: True
+        bias: false
+        use_fast_path: true
+
+      # Attention Config
+      attn_cfg:
+        num_heads: 16
+        head_dim: null
+        mlp_dim: 256
+        qkv_proj_bias: false
+        out_proj_bias: True
+        use_flash_attn: false
+        dropout: 0.0
+
+      # Caduceus Params
+      bidirectional: true
+      bidirectional_strategy: "add"
+      bidirectional_weight_tie: true
+      rcps: false
+
+      # Positional Embeddings (must cover full input length for encoder attention)
+      use_fourier_pos_emb: true
+      fourier_max_seq_len: 131072
+      fourier_dim: null
+      fourier_init: "eye_xavier_norm"
+
+      # Gated Attention (Thesis: headwise gate for DualRep)
+      headwise_attn_output_gate: true
+      elementwise_attn_output_gate: false
+
+      # Init
+      initializer_cfg:
+        initializer_range: 0.02
+        rescale_prenorm_residual: true
+        n_residuals_per_layer: 1
+
+  # --- Head Configuration (Simple Projection) ---
+  head_config:
+    d_model: 256              # Auto-updated from encoder
+    num_tracks: 5313          # Human tracks (1643 for mouse)
+    hidden_dim: 512           # MLP hidden dim
+    target_len: 896           # SF-Fuse target bins
+    dropout: 0.4
+
+  # --- MLM Joint Training ---
+  # When enabled, encoder is simultaneously trained with MLM auxiliary loss.
+  use_mlm_loss: false
+  mlm_lambda: 0.1            # Weight: total = task_loss + mlm_lambda * mlm_loss
+  mlm_probability: 0.15      # Masking probability per token
+  mask_token_id: 5            # Token ID for [MASK]
+  mlm_strategy: default       # Masking strategy: default, aggressive, conservative, uniform
+                              # - default: 80% mask, 10% random, 10% keep (standard BERT)
+                              # - aggressive: higher mask ratio for difficult contexts
+                              # - conservative: lower mask ratio for easy contexts
+                              # - uniform: fixed mask ratio across all contexts
+
+  # --- Optimizer & Scheduler (for fine-tuning) ---
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 5e-4
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 1000
+    min_lr: 1e-6
+
+  # --- Training Strategy ---
+  freeze_encoder: false
+  pretrained_ckpt_path: null
+
+  # --- Data Configuration ---
+  dataset:
+    train_data_file: "./data/raw/human_train.h5"
+    train_targets_file: null
+    val_data_file: "./data/raw/human_valid.h5"
+    val_targets_file: null
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 1
+    num_workers: 4
+    max_length: 131072

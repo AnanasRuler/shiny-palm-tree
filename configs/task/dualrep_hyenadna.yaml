@@ -1,0 +1,181 @@
+# @package _global_
+
+# ============================================================================
+# DualRep with HyenaDNA Encoder
+# ============================================================================
+# Architecture:
+#   Input tokens (B, 131072)
+#   → HyenaDNA Embedding (8 layers, d_model=256)
+#   → All 8 encoder layers at full 131k length (HyenaDNA has no internal layers split)
+#   → CNN Bridge [128x downsampling: 131072 → 1024]
+#   → 11-layer Gated Attention Decoder (trained from scratch)
+#   → Simple Projection Head [center crop to 896 + MLP]
+#   → (B, 896, 5313)
+#
+# Pretrained encoder: LongSafari/hyenadna-large-1m-seqlen-hf
+# - d_model: 256, n_layer: 8, max_seq_len: 1000002
+# - Uses Hyena operators (subquadratic long convolutions)
+# - No Fourier position encoding (implicit convolutions)
+# ============================================================================
+
+name: "dualrep_hyenadna_d256"
+
+wandb:
+  project: sf-fuse-ft
+  group: "dualrep-hyenadna"
+  job_type: fine-tuning
+  mode: disabled
+  name: ${name}
+  save_dir: "."
+  id: null
+
+task:
+  _target_: src.tasks.unified_task.SFFuseTask
+  _recursive_: false
+
+  # All 8 HyenaDNA layers process full-length sequence before bridge
+  n_pre_layers: 8
+
+  # CNN Bridge: 128x downsampling (131072 -> 1024)
+  bridge_config:
+    d_model: 256
+    num_downsample_stages: 7
+    kernel_size: 5
+    dropout: 0.1
+
+  # Encoder Configuration (HyenaDNA)
+  # d_model: 256, n_layer: 8 (from HF large-1m model)
+  encoder_config:
+    _name_: hyenadna
+    config:
+      d_model: 256
+      n_layer: 8
+      vocab_size: 12
+      max_seq_len: 160002
+
+  # Decoder Configuration (11-layer Gated Attention Decoder)
+  decoder_config:
+    _target_: src.models.gated_attention_decoder.GatedAttentionDecoder
+    d_model: 256
+    n_layers: 11
+    num_heads: 8
+    head_dim: null  # 256 / 8 = 32 dim per head
+    mlp_dim: 512  # 2× d_model
+    dropout: 0.0
+    headwise_gate: true
+    elementwise_gate: false
+    causal_mask: false
+    use_fourier_pos_emb: true
+    fourier_max_seq_len: 1024
+    fourier_dim: null
+
+  # Head Configuration
+  head_config:
+    d_model: 256
+    num_tracks: 5313
+    hidden_dim: 512  # 2× d_model
+    target_len: 896
+    dropout: 0.4
+
+  # No joint MLM loss - use pretrained encoder
+  use_mlm_loss: false
+
+  # LoRA Configuration for fine-tuning
+  use_lora: true
+  lora_config:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+      - query
+      - value
+
+  # Optimizer & Scheduler
+  optimizer_config:
+    name: AdamW
+    args:
+      lr: 3e-4  # Conservative LR for LoRA fine-tuning
+      weight_decay: 0.01
+
+  scheduler_config:
+    name: cosine_warmup
+    warmup_steps: 500  # ~0.25 epoch
+    min_lr: 1e-5
+
+  # Training Strategy
+  freeze_encoder: false
+  pretrained_ckpt_path: "LongSafari/hyenadna-large-1m-seqlen-hf"
+
+  # Data Configuration (H5 format for fine-tuning)
+  dataset:
+    train_data_file: "./data/space/human_train.h5"
+    val_data_file: "./data/space/human_valid.h5"
+    seq_key: "sequences"
+    tgt_key: "targets"
+    batch_size: 2
+    num_workers: 8
+    max_length: 131072
+
+# Trainer config for fine-tuning
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  num_nodes: 1
+  min_epochs: 1
+  max_epochs: 15
+  enable_model_summary: true
+  log_every_n_steps: 100
+  precision: bf16
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 2
+  check_val_every_n_epoch: 1
+  limit_train_batches: null
+  limit_val_batches: null
+  max_steps: 25000
+
+callbacks:
+  # Validation uses ValEveryNGlobalSteps callback for step-based validation
+  # (native trainer.val_check_interval counts batches, not global steps)
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+  params:
+    _target_: src.callbacks.params.ParamsLog
+    total: true
+    trainable: true
+    fixed: true
+  timer:
+    _target_: src.callbacks.timer.Timer
+    step: true
+    inter_step: false
+    epoch: true
+    val: true
+  progress_bar:
+    _target_: pytorch_lightning.callbacks.TQDMProgressBar
+    refresh_rate: 50
+  # RichModelSummary removed - causes DDP hangs
+  model_checkpoint_best:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "best"
+    monitor: "val/pcc_all"
+    mode: "max"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    save_on_train_epoch_end: false
+  model_checkpoint_last:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "checkpoints/"
+    filename: "last"
+    monitor: null
+    mode: "min"
+    save_top_k: 1
+    save_last: false
+    auto_insert_metric_name: false
+    verbose: true
+    every_n_train_steps: 500
+    save_on_train_epoch_end: false
